@@ -1,0 +1,26 @@
+# Binaries for programs and plugins
+*.exe
+*.dll
+*.so
+*.dylib
+*.log
+# Test binary, build with `go test -c`
+*.test
+.gradle/
+# Output of the go coverage tool, specifically when used with LiteIDE
+*.out
+db/3/metadata.json
+db/3/vulnerability.db
+# Project-local glide cache, RE: https://github.com/Masterminds/glide/issues/736
+.glide/
+
+/cmd
+/.idea
+
+/bin/build_*
+
+experiments/
+.vscode/
+__pycache__
+
+.DS_Store

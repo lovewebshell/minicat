@@ -1,0 +1,400 @@
+/*
+Package source provides an abstraction to allow a user to loosely define a data source to catalog and expose a common interface that
+catalogers and use explore and analyze data from the data source. All valid (cataloggable) data sources are defined
+within this package.
+*/
+package source
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+
+	"github.com/bmatcuk/doublestar/v4"
+	"github.com/mholt/archiver/v3"
+	"github.com/spf13/afero"
+
+	"github.com/anchore/stereoscope"
+	"github.com/anchore/stereoscope/pkg/image"
+	"github.com/lovewebshell/minicat/internal/log"
+)
+
+type Source struct {
+	Image             *image.Image
+	Metadata          Metadata
+	directoryResolver *directoryResolver
+	path              string
+	mutex             *sync.Mutex
+	Exclusions        []string
+}
+
+type Input struct {
+	UserInput                       string
+	Scheme                          Scheme
+	ImageSource                     image.Source
+	Location                        string
+	Platform                        string
+	autoDetectAvailableImageSources bool
+}
+
+func ParseInput(userInput string, platform string, detectAvailableImageSources bool) (*Input, error) {
+	fs := afero.NewOsFs()
+	scheme, source, location, err := DetectScheme(fs, image.DetectSource, userInput)
+	if err != nil {
+		return nil, err
+	}
+
+	if source == image.UnknownSource {
+
+		switch scheme {
+		case ImageScheme, UnknownScheme:
+			if detectAvailableImageSources {
+				if imagePullSource := image.DetermineDefaultImagePullSource(userInput); imagePullSource != image.UnknownSource {
+					scheme = ImageScheme
+					source = imagePullSource
+					location = userInput
+				}
+			}
+			if location == "" {
+				location = userInput
+			}
+		default:
+		}
+	}
+
+	if scheme != ImageScheme && platform != "" {
+		return nil, fmt.Errorf("cannot specify a platform for a non-image source")
+	}
+
+	return &Input{
+		UserInput:                       userInput,
+		Scheme:                          scheme,
+		ImageSource:                     source,
+		Location:                        location,
+		Platform:                        platform,
+		autoDetectAvailableImageSources: detectAvailableImageSources,
+	}, nil
+}
+
+type sourceDetector func(string) (image.Source, string, error)
+
+func NewFromRegistry(in Input, registryOptions *image.RegistryOptions, exclusions []string) (*Source, func(), error) {
+	source, cleanupFn, err := generateImageSource(in, registryOptions)
+	if source != nil {
+		source.Exclusions = exclusions
+	}
+	return source, cleanupFn, err
+}
+
+func New(in Input, registryOptions *image.RegistryOptions, exclusions []string) (*Source, func(), error) {
+	var err error
+	fs := afero.NewOsFs()
+	var source *Source
+	cleanupFn := func() {}
+
+	switch in.Scheme {
+	case FileScheme:
+		source, cleanupFn, err = generateFileSource(fs, in.Location)
+	case DirectoryScheme:
+		source, cleanupFn, err = generateDirectorySource(fs, in.Location)
+	case ImageScheme:
+		source, cleanupFn, err = generateImageSource(in, registryOptions)
+	default:
+		err = fmt.Errorf("unable to process input for scanning: %q", in.UserInput)
+	}
+
+	if err == nil {
+		source.Exclusions = exclusions
+	}
+
+	return source, cleanupFn, err
+}
+
+func generateImageSource(in Input, registryOptions *image.RegistryOptions) (*Source, func(), error) {
+	img, cleanup, err := getImageWithRetryStrategy(in, registryOptions)
+	if err != nil || img == nil {
+		return nil, cleanup, fmt.Errorf("could not fetch image %q: %w", in.Location, err)
+	}
+
+	s, err := NewFromImage(img, in.Location)
+	if err != nil {
+		return nil, cleanup, fmt.Errorf("could not populate source with image: %w", err)
+	}
+
+	return &s, cleanup, nil
+}
+
+func parseScheme(userInput string) string {
+	parts := strings.SplitN(userInput, ":", 2)
+	if len(parts) < 2 {
+		return ""
+	}
+
+	return parts[0]
+}
+
+func getImageWithRetryStrategy(in Input, registryOptions *image.RegistryOptions) (*image.Image, func(), error) {
+	ctx := context.TODO()
+
+	var opts []stereoscope.Option
+	if registryOptions != nil {
+		opts = append(opts, stereoscope.WithRegistryOptions(*registryOptions))
+	}
+
+	if in.Platform != "" {
+		opts = append(opts, stereoscope.WithPlatform(in.Platform))
+	}
+
+	img, err := stereoscope.GetImageFromSource(ctx, in.Location, in.ImageSource, opts...)
+	cleanup := func() {
+		if err := img.Cleanup(); err != nil {
+			log.Warnf("unable to cleanup image=%q: %w", in.UserInput, err)
+		}
+	}
+	if err == nil {
+
+		return img, cleanup, nil
+	}
+
+	scheme := parseScheme(in.UserInput)
+	if !(scheme == "docker" || scheme == "registry") {
+
+		return nil, nil, err
+	}
+
+	log.Warnf(
+		"scheme %q specified, but it coincides with a common image name; re-examining user input %q"+
+			" without scheme parsing because image retrieval using scheme parsing was unsuccessful: %v",
+		scheme,
+		in.UserInput,
+		err,
+	)
+
+	if in.autoDetectAvailableImageSources {
+		in.ImageSource = image.DetermineDefaultImagePullSource(in.UserInput)
+	}
+	img, err = stereoscope.GetImageFromSource(ctx, in.UserInput, in.ImageSource, opts...)
+	cleanup = func() {
+		if err := img.Cleanup(); err != nil {
+			log.Warnf("unable to cleanup image=%q: %w", in.UserInput, err)
+		}
+	}
+	return img, cleanup, err
+}
+
+func generateDirectorySource(fs afero.Fs, location string) (*Source, func(), error) {
+	fileMeta, err := fs.Stat(location)
+	if err != nil {
+		return nil, func() {}, fmt.Errorf("unable to stat dir=%q: %w", location, err)
+	}
+
+	if !fileMeta.IsDir() {
+		return nil, func() {}, fmt.Errorf("given path is not a directory (path=%q): %w", location, err)
+	}
+
+	s, err := NewFromDirectory(location)
+	if err != nil {
+		return nil, func() {}, fmt.Errorf("could not populate source from path=%q: %w", location, err)
+	}
+
+	return &s, func() {}, nil
+}
+
+func generateFileSource(fs afero.Fs, location string) (*Source, func(), error) {
+	fileMeta, err := fs.Stat(location)
+	if err != nil {
+		return nil, func() {}, fmt.Errorf("unable to stat dir=%q: %w", location, err)
+	}
+
+	if fileMeta.IsDir() {
+		return nil, func() {}, fmt.Errorf("given path is not a directory (path=%q): %w", location, err)
+	}
+
+	s, cleanupFn := NewFromFile(location)
+
+	return &s, cleanupFn, nil
+}
+
+func NewFromDirectory(path string) (Source, error) {
+	return Source{
+		mutex: &sync.Mutex{},
+		Metadata: Metadata{
+			Scheme: DirectoryScheme,
+			Path:   path,
+		},
+		path: path,
+	}, nil
+}
+
+func NewFromFile(path string) (Source, func()) {
+	analysisPath, cleanupFn := fileAnalysisPath(path)
+
+	return Source{
+		mutex: &sync.Mutex{},
+		Metadata: Metadata{
+			Scheme: FileScheme,
+			Path:   path,
+		},
+		path: analysisPath,
+	}, cleanupFn
+}
+
+func fileAnalysisPath(path string) (string, func()) {
+	var analysisPath = path
+	var cleanupFn = func() {}
+
+	envelopedUnarchiver, err := archiver.ByExtension(path)
+	if unarchiver, ok := envelopedUnarchiver.(archiver.Unarchiver); err == nil && ok {
+		unarchivedPath, tmpCleanup, err := unarchiveToTmp(path, unarchiver)
+		if err != nil {
+			log.Warnf("file could not be unarchived: %+v", err)
+		} else {
+			log.Debugf("source path is an archive")
+			analysisPath = unarchivedPath
+		}
+		if tmpCleanup != nil {
+			cleanupFn = tmpCleanup
+		}
+	}
+
+	return analysisPath, cleanupFn
+}
+
+func NewFromImage(img *image.Image, userImageStr string) (Source, error) {
+	if img == nil {
+		return Source{}, fmt.Errorf("no image given")
+	}
+
+	return Source{
+		Image: img,
+		Metadata: Metadata{
+			Scheme:        ImageScheme,
+			ImageMetadata: NewImageMetadata(img, userImageStr),
+		},
+	}, nil
+}
+
+func (s *Source) FileResolver(scope Scope) (FileResolver, error) {
+	switch s.Metadata.Scheme {
+	case DirectoryScheme, FileScheme:
+		s.mutex.Lock()
+		defer s.mutex.Unlock()
+		if s.directoryResolver == nil {
+			exclusionFunctions, err := getDirectoryExclusionFunctions(s.path, s.Exclusions)
+			if err != nil {
+				return nil, err
+			}
+			resolver, err := newDirectoryResolver(s.path, exclusionFunctions...)
+			if err != nil {
+				return nil, fmt.Errorf("unable to create directory resolver: %w", err)
+			}
+			s.directoryResolver = resolver
+		}
+		return s.directoryResolver, nil
+	case ImageScheme:
+		var resolver FileResolver
+		var err error
+		switch scope {
+		case SquashedScope:
+			resolver, err = newImageSquashResolver(s.Image)
+		case AllLayersScope:
+			resolver, err = newAllLayersResolver(s.Image)
+		default:
+			return nil, fmt.Errorf("bad image scope provided: %+v", scope)
+		}
+		if err != nil {
+			return nil, err
+		}
+
+		if len(s.Exclusions) > 0 {
+			resolver = NewExcludingResolver(resolver, getImageExclusionFunction(s.Exclusions))
+		}
+		return resolver, nil
+	}
+	return nil, fmt.Errorf("unable to determine FilePathResolver with current scheme=%q", s.Metadata.Scheme)
+}
+
+func unarchiveToTmp(path string, unarchiver archiver.Unarchiver) (string, func(), error) {
+	tempDir, err := os.MkdirTemp("", "archive-contents-")
+	if err != nil {
+		return "", func() {}, fmt.Errorf("unable to create tempdir for archive processing: %w", err)
+	}
+
+	cleanupFn := func() {
+		if err := os.RemoveAll(tempDir); err != nil {
+			log.Warnf("unable to cleanup archive tempdir: %+v", err)
+		}
+	}
+
+	return tempDir, cleanupFn, unarchiver.Unarchive(path, tempDir)
+}
+
+func getImageExclusionFunction(exclusions []string) func(string) bool {
+	if len(exclusions) == 0 {
+		return nil
+	}
+
+	for _, exclusion := range exclusions {
+		exclusions = append(exclusions, exclusion+"/**")
+	}
+	return func(path string) bool {
+		for _, exclusion := range exclusions {
+			matches, err := doublestar.Match(exclusion, path)
+			if err != nil {
+				return false
+			}
+			if matches {
+				return true
+			}
+		}
+		return false
+	}
+}
+
+func getDirectoryExclusionFunctions(root string, exclusions []string) ([]pathFilterFn, error) {
+	if len(exclusions) == 0 {
+		return nil, nil
+	}
+
+	root, err := filepath.Abs(root)
+	if err != nil {
+		return nil, err
+	}
+
+	if !strings.HasSuffix(root, "/") {
+		root += "/"
+	}
+
+	var errors []string
+	for idx, exclusion := range exclusions {
+
+		if strings.HasPrefix(exclusion, "./") || strings.HasPrefix(exclusion, "*/") || strings.HasPrefix(exclusion, "**/") {
+			exclusion = strings.TrimPrefix(exclusion, "./")
+			exclusions[idx] = root + exclusion
+		} else {
+			errors = append(errors, exclusion)
+		}
+	}
+
+	if errors != nil {
+		return nil, fmt.Errorf("invalid exclusion pattern(s): '%s' (must start with one of: './', '*/', or '**/')", strings.Join(errors, "', '"))
+	}
+
+	return []pathFilterFn{
+		func(path string, _ os.FileInfo) bool {
+			for _, exclusion := range exclusions {
+				matches, err := doublestar.Match(exclusion, path)
+				if err != nil {
+					return false
+				}
+				if matches {
+					return true
+				}
+			}
+			return false
+		},
+	}, nil
+}
